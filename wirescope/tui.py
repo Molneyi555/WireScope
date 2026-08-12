@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import curses
+import copy
+import hashlib
 import json
 import os
 import shutil
@@ -13,11 +15,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 
+from . import __version__
+from .artifacts import atomic_write_text
 from .macos import MacOSAdapter
 from .models import Connection, Interface, utc_now
 
 
-TABS = ("Overview", "Connections", "Processes", "Interfaces", "DNS", "VPN", "Routes")
+TABS = ("Overview", "Connections", "Processes", "Interfaces", "DNS", "VPN", "Routes", "Timeline")
 SPARKS = "▁▂▃▄▅▆▇█"
 
 
@@ -57,12 +61,127 @@ def connection_target(connection: Connection) -> str:
     return connection.remote.display() if connection.remote else connection.local.display()
 
 
+def event_time_label(timestamp: str) -> str:
+    if "T" in timestamp and len(timestamp) >= 19:
+        return timestamp[11:19]
+    return fit(timestamp, 12)
+
+
+def stable_fingerprint(value: Any) -> str:
+    """Return a deterministic fingerprint for JSON-like sensor state."""
+
+    serialized = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(serialized.encode("utf-8", errors="replace")).hexdigest()
+
+
+def network_state_summary(name: str, value: Any) -> str:
+    """Build a compact, non-interpretive description of a native sensor snapshot."""
+
+    if name == "routes":
+        routes = value if isinstance(value, list) else []
+        defaults = [item for item in routes if isinstance(item, dict) and item.get("destination") == "default"]
+        if defaults:
+            route = defaults[0]
+            return f"{len(routes)} routes; default via {route.get('interface', '?')} → {route.get('gateway', '?')}"
+        return f"{len(routes)} routes; no IPv4 default observed"
+    if name == "dns":
+        resolvers = value if isinstance(value, list) else []
+        servers = {
+            str(server)
+            for resolver in resolvers
+            if isinstance(resolver, dict)
+            for server in resolver.get("nameservers", [])
+        }
+        return f"{len(resolvers)} resolvers; {', '.join(sorted(servers)) if servers else 'no nameservers exposed'}"
+    if name == "vpn":
+        vpn = value if isinstance(value, dict) else {}
+        interfaces = [
+            str(item.get("name"))
+            for item in vpn.get("interfaces", [])
+            if isinstance(item, dict) and item.get("name")
+        ]
+        status = "active" if vpn.get("active") else "not detected"
+        return f"VPN {status}; interfaces {', '.join(interfaces) if interfaces else '—'}"
+    if name == "proxy":
+        proxy = value if isinstance(value, dict) else {}
+        enabled = sorted(
+            key[:-6]
+            for key, setting in proxy.items()
+            if key.endswith("Enable") and setting not in (0, "0", False, None, "")
+        )
+        return f"proxy {'enabled: ' + ', '.join(enabled) if enabled else 'not enabled'}"
+    return fit(str(value), 120)
+
+
+def capability_rows(report: Any) -> List[Dict[str, Any]]:
+    """Normalize current and legacy adapter capability reports for the TUI."""
+
+    if not isinstance(report, dict):
+        return []
+    raw = report.get("capabilities", report)
+    if not isinstance(raw, dict):
+        return []
+    rows: List[Dict[str, Any]] = []
+    for name, status in raw.items():
+        if not isinstance(status, dict) or "available" not in status:
+            continue
+        rows.append(
+            {
+                "name": str(name),
+                "available": bool(status.get("available")),
+                "requires_root": bool(status.get("requires_root")),
+                "description": str(status.get("description") or ""),
+                "missing_tools": [str(item) for item in status.get("missing_tools", [])],
+            }
+        )
+    return sorted(rows, key=lambda item: (not item["available"], item["name"]))
+
+
+def diagnostic_health(
+    capabilities: Any, command_diagnostics: Any, parser_diagnostics: Any
+) -> Dict[str, int]:
+    rows = capability_rows(capabilities)
+    commands = command_diagnostics if isinstance(command_diagnostics, list) else []
+    parsers = parser_diagnostics if isinstance(parser_diagnostics, list) else []
+    return {
+        "capabilities_available": sum(bool(item["available"]) for item in rows),
+        "capabilities_total": len(rows),
+        "command_failures": sum(item.get("ok") is False for item in commands if isinstance(item, dict)),
+        "command_warnings": sum(bool(item.get("warning_kind")) for item in commands if isinstance(item, dict)),
+        "parser_warnings": sum(bool(item.get("warnings")) for item in parsers if isinstance(item, dict)),
+        "parser_low_confidence": sum(
+            str(item.get("confidence", "")).lower() in ("low", "unknown")
+            for item in parsers
+            if isinstance(item, dict)
+        ),
+    }
+
+
 @dataclass
 class LiveEvent:
     timestamp: str
     kind: str
     process: str
     target: str
+    event_type: str = "connection.changed"
+    source: str = "system.connections"
+    severity: str = "info"
+    summary: str = ""
+    details: Dict[str, Any] = field(default_factory=dict)
+
+    def search_text(self) -> str:
+        return " ".join(
+            (
+                self.timestamp,
+                self.kind,
+                self.process,
+                self.target,
+                self.event_type,
+                self.source,
+                self.severity,
+                self.summary,
+            )
+        ).lower()
 
 
 @dataclass
@@ -88,7 +207,14 @@ class LiveState:
     rates: Dict[str, Dict[str, float]] = field(default_factory=dict)
     history_rx: Deque[float] = field(default_factory=lambda: deque(maxlen=60))
     history_tx: Deque[float] = field(default_factory=lambda: deque(maxlen=60))
-    events: Deque[LiveEvent] = field(default_factory=lambda: deque(maxlen=100))
+    events: Deque[LiveEvent] = field(default_factory=lambda: deque(maxlen=500))
+    network_fingerprints: Dict[str, str] = field(default_factory=dict)
+    network_values: Dict[str, Any] = field(default_factory=dict)
+    capabilities: Dict[str, Any] = field(default_factory=dict)
+    command_health: List[Dict[str, Any]] = field(default_factory=list)
+    parser_health: List[Dict[str, Any]] = field(default_factory=list)
+    health_error: str = ""
+    marker_count: int = 0
     opened_total: int = 0
     closed_total: int = 0
     refresh_count: int = 0
@@ -101,6 +227,100 @@ class LiveState:
     resolved_names: Dict[str, str] = field(default_factory=dict)
     route_details: Dict[str, Dict[str, str]] = field(default_factory=dict)
 
+    def add_event(self, event: LiveEvent) -> None:
+        self.events.appendleft(event)
+
+    def observe_network_state(self, name: str, value: Any, timestamp: Optional[str] = None) -> bool:
+        """Record the initial snapshot or a changed network state.
+
+        Returns True when an event was added, which keeps this helper easy to
+        test independently from curses and native commands.
+        """
+
+        fingerprint = stable_fingerprint(value)
+        previous_fingerprint = self.network_fingerprints.get(name)
+        if previous_fingerprint == fingerprint:
+            return False
+        current_value = copy.deepcopy(value)
+        previous_value = copy.deepcopy(self.network_values.get(name))
+        event_suffix = "snapshot" if previous_fingerprint is None else "changed"
+        summary = network_state_summary(name, current_value)
+        self.add_event(
+            LiveEvent(
+                timestamp=timestamp or utc_now(),
+                kind="●" if previous_fingerprint is None else "~",
+                process=name.upper(),
+                target=summary,
+                event_type=f"network.{name}.{event_suffix}",
+                source=f"system.{name}",
+                severity="info" if previous_fingerprint is None else "notice",
+                summary=summary,
+                details={
+                    "previous": previous_value,
+                    "current": current_value,
+                    "previous_fingerprint": previous_fingerprint,
+                    "fingerprint": fingerprint,
+                },
+            )
+        )
+        self.network_fingerprints[name] = fingerprint
+        self.network_values[name] = current_value
+        return True
+
+    def refresh_health(self) -> None:
+        """Read optional structured health APIs without requiring new adapters."""
+
+        try:
+            capabilities = getattr(self.adapter, "capabilities", None)
+            commands = getattr(self.adapter, "command_diagnostics", None)
+            parsers = getattr(self.adapter, "parser_diagnostics", None)
+            self.capabilities = capabilities() if callable(capabilities) else {}
+            self.command_health = commands() if callable(commands) else []
+            self.parser_health = parsers() if callable(parsers) else []
+            if not isinstance(self.capabilities, dict):
+                self.capabilities = {}
+            if not isinstance(self.command_health, list):
+                self.command_health = []
+            if not isinstance(self.parser_health, list):
+                self.parser_health = []
+            self.health_error = ""
+        except Exception as exc:
+            # Health is advisory: a third-party/older adapter must not take
+            # down the live dashboard merely because this API is absent or bad.
+            self.health_error = str(exc)[:160]
+
+    def filtered_events(self) -> List[LiveEvent]:
+        values = list(self.events)
+        if self.query:
+            query = self.query.lower()
+            values = [item for item in values if query in item.search_text()]
+        return values
+
+    def selected_event(self) -> Optional[LiveEvent]:
+        values = self.filtered_events()
+        if not values:
+            return None
+        self.selection = max(0, min(self.selection, len(values) - 1))
+        return values[self.selection]
+
+    def add_marker(self, message: str = "User marker") -> LiveEvent:
+        message = message.strip() or "User marker"
+        self.marker_count += 1
+        event = LiveEvent(
+            timestamp=utc_now(),
+            kind="◆",
+            process="USER",
+            target=message,
+            event_type="user.marker",
+            source="user",
+            severity="notice",
+            summary=message,
+            details={"message": message, "marker_number": self.marker_count},
+        )
+        self.add_event(event)
+        self.notice = f"Marker #{self.marker_count}: {message}"
+        return event
+
     def refresh(self, force_static: bool = False) -> None:
         if self.paused:
             return
@@ -111,15 +331,37 @@ class LiveState:
             if self.process_filter:
                 current_values = [item for item in current_values if self.process_filter.lower() in item.process.lower()]
             current = {item.key(): item for item in current_values}
-            now_label = time.strftime("%H:%M:%S")
+            now_label = utc_now()
             if self.refresh_count > 0:
                 for key in current.keys() - previous.keys():
                     item = current[key]
-                    self.events.appendleft(LiveEvent(now_label, "+", item.process, connection_target(item)))
+                    target = connection_target(item)
+                    self.add_event(
+                        LiveEvent(
+                            now_label,
+                            "+",
+                            item.process,
+                            target,
+                            event_type="connection.opened",
+                            summary=f"{item.process} opened {target}",
+                            details=item.to_dict(),
+                        )
+                    )
                     self.opened_total += 1
                 for key in previous.keys() - current.keys():
                     item = previous[key]
-                    self.events.appendleft(LiveEvent(now_label, "−", item.process, connection_target(item)))
+                    target = connection_target(item)
+                    self.add_event(
+                        LiveEvent(
+                            now_label,
+                            "−",
+                            item.process,
+                            target,
+                            event_type="connection.closed",
+                            summary=f"{item.process} closed {target}",
+                            details=item.to_dict(),
+                        )
+                    )
                     self.closed_total += 1
             self.connections = list(current.values())
 
@@ -146,8 +388,13 @@ class LiveState:
                 self.resolvers = self.adapter.dns_resolvers()
                 self.vpn = self.adapter.vpn_status()
                 self.proxy = self.adapter.proxy_config()
+                self.observe_network_state("routes", self.routes, now_label)
+                self.observe_network_state("dns", self.resolvers, now_label)
+                self.observe_network_state("vpn", self.vpn, now_label)
+                self.observe_network_state("proxy", self.proxy, now_label)
+                self.refresh_health()
             self.refresh_count += 1
-            self.last_updated = now_label
+            self.last_updated = time.strftime("%H:%M:%S")
             self.last_refresh = time.monotonic()
             self.collection_ms = (self.last_refresh - started) * 1000
             self.error = ""
@@ -203,8 +450,11 @@ class LiveState:
             "proxy": self.proxy,
             "interface_counters": self.counters,
             "events": [event.__dict__ for event in self.events],
+            "capabilities": self.capabilities,
+            "command_diagnostics": self.command_health,
+            "parser_diagnostics": self.parser_health,
         }
-        path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_text(path, json.dumps(report, ensure_ascii=False, indent=2))
         self.notice = f"Exported {path}"
         return str(path)
 
@@ -254,7 +504,7 @@ def color(index: int) -> int:
 
 def draw_header(screen: Any, state: LiveState) -> int:
     height, width = screen.getmaxyx()
-    title = " WireScope 0.2.0 "
+    title = f" WireScope {__version__} "
     status = "PAUSED" if state.paused else f"LIVE {state.last_updated}"
     safe_add(screen, 0, 0, title, curses.A_BOLD | color(1))
     safe_add(screen, 0, max(len(title) + 1, width - len(status) - 2), status, curses.A_BOLD | color(3 if state.paused else 2))
@@ -273,7 +523,7 @@ def draw_status(screen: Any, state: LiveState) -> None:
     height, width = screen.getmaxyx()
     message = state.error or state.notice
     if not message:
-        message = f"q quit  ←/→ tabs  ↑/↓ select  / filter  s sort:{state.sort_mode}  x closed:{'on' if state.show_closed else 'off'}  d details  n DNS  g route  p pause  e export  ? help"
+        message = "q quit  ←/→ tabs  ↑/↓ select  / filter  m marker  d details  p pause  e export  ? help"
     attr = color(4) | curses.A_BOLD if state.error else color(5)
     safe_add(screen, height - 1, 0, fit(" " + message, width - 1), attr)
 
@@ -315,12 +565,39 @@ def draw_overview(screen: Any, state: LiveState, top: int) -> None:
         safe_add(screen, top + 4 + index, split, f"{fit(name, 22):22} {count:>5} connections")
 
     event_top = top + 9
-    safe_add(screen, event_top, 1, "RECENT CONNECTION EVENTS", curses.A_BOLD | color(1))
-    for index, event in enumerate(list(state.events)[: max(1, height - event_top - 3)]):
-        pair = 2 if event.kind == "+" else 4
-        safe_add(screen, event_top + 1 + index, 1, f"{event.timestamp} {event.kind} {fit(event.process, 16):16} {event.target}", color(pair))
+    health = diagnostic_health(state.capabilities, state.command_health, state.parser_health)
+    available = health["capabilities_available"]
+    total = health["capabilities_total"]
+    health_text = (
+        f"SENSORS {available}/{total}  command failures {health['command_failures']}  "
+        f"warnings {health['command_warnings']}  parser low-confidence {health['parser_low_confidence']}"
+        if total
+        else "SENSORS health API unavailable (legacy adapter)"
+    )
+    safe_add(screen, event_top, 1, health_text, color(3) if health["command_failures"] else color(5))
+    event_top += 2
+    split_events = width >= 104
+    event_width = max(20, (width // 2) - 3) if split_events else max(20, width - 3)
+    safe_add(screen, event_top, 1, "RECENT TIMELINE EVENTS", curses.A_BOLD | color(1))
+    visible_rows = max(1, height - event_top - 3)
+    for index, event in enumerate(list(state.events)[:visible_rows]):
+        pair = 2 if event.kind == "+" else (4 if event.kind == "−" else 3 if event.severity == "notice" else 5)
+        label = f"{event_time_label(event.timestamp)} {event.kind} {fit(event.event_type, 24)} {event.summary or event.target}"
+        safe_add(screen, event_top + 1 + index, 1, fit(label, event_width), color(pair))
     if not state.events:
         safe_add(screen, event_top + 1, 1, "Waiting for changes…", color(5))
+
+    if split_events:
+        health_x = width // 2 + 1
+        safe_add(screen, event_top, health_x, "CAPABILITY HEALTH", curses.A_BOLD | color(1))
+        rows = capability_rows(state.capabilities)
+        for index, item in enumerate(rows[:visible_rows]):
+            marker = "OK" if item["available"] else "MISS"
+            root = " root" if item["requires_root"] else ""
+            line = f"{marker:4} {item['name']}{root}"
+            safe_add(screen, event_top + 1 + index, health_x, line, color(2 if item["available"] else 4))
+        if state.health_error:
+            safe_add(screen, event_top + 1, health_x, "Health: " + state.health_error, color(4))
 
 
 def draw_connections(screen: Any, state: LiveState, top: int) -> None:
@@ -475,24 +752,109 @@ def draw_routes(screen: Any, state: LiveState, top: int) -> None:
         safe_add(screen, top + 2 + index, 1, text, attr)
 
 
+def draw_timeline(screen: Any, state: LiveState, top: int) -> None:
+    height, width = screen.getmaxyx()
+    values = state.filtered_events()
+    detail_visible = state.show_detail and height >= 18
+    detail_height = 9 if detail_visible else 0
+    available = max(1, height - top - 3 - detail_height)
+    state.selection = max(0, min(state.selection, max(0, len(values) - 1)))
+    if state.selection < state.scroll:
+        state.scroll = state.selection
+    elif state.selection >= state.scroll + available:
+        state.scroll = state.selection - available + 1
+
+    query = f" · filter={state.query!r}" if state.query else ""
+    safe_add(
+        screen,
+        top,
+        1,
+        f"{len(values)}/{len(state.events)} events · newest first · markers {state.marker_count}{query}",
+        color(5),
+    )
+    if width >= 92:
+        type_width = min(30, max(20, width // 4))
+        source_width = min(22, max(14, width // 6))
+        summary_width = max(12, width - type_width - source_width - 19)
+        safe_add(
+            screen,
+            top + 1,
+            1,
+            f"{'TIME':8} {'K':1} {'TYPE':{type_width}} {'SOURCE':{source_width}} SUMMARY",
+            curses.A_BOLD,
+        )
+    else:
+        type_width = min(25, max(16, width // 3))
+        source_width = 0
+        summary_width = max(10, width - type_width - 14)
+        safe_add(screen, top + 1, 1, f"{'TIME':8} {'K':1} {'TYPE':{type_width}} SUMMARY", curses.A_BOLD)
+
+    for row, event in enumerate(values[state.scroll : state.scroll + available]):
+        absolute = state.scroll + row
+        summary = event.summary or event.target
+        if source_width:
+            text = (
+                f"{event_time_label(event.timestamp):8} {event.kind:1} "
+                f"{fit(event.event_type, type_width):{type_width}} "
+                f"{fit(event.source, source_width):{source_width}} {fit(summary, summary_width)}"
+            )
+        else:
+            text = (
+                f"{event_time_label(event.timestamp):8} {event.kind:1} "
+                f"{fit(event.event_type, type_width):{type_width}} {fit(summary, summary_width)}"
+            )
+        attr = curses.A_REVERSE if absolute == state.selection else 0
+        if event.kind == "+":
+            attr |= color(2)
+        elif event.kind == "−" or event.severity in ("error", "critical"):
+            attr |= color(4)
+        elif event.severity in ("notice", "warning"):
+            attr |= color(3)
+        else:
+            attr |= color(5)
+        safe_add(screen, top + 2 + row, 1, text, attr)
+    if not values:
+        safe_add(screen, top + 3, 2, "No matching timeline events", color(3))
+
+    if detail_visible:
+        event = state.selected_event()
+        detail_top = height - 10
+        safe_add(screen, detail_top, 0, "─" * max(0, width - 1), color(5))
+        safe_add(screen, detail_top + 1, 1, "EVENT DETAILS", curses.A_BOLD | color(1))
+        if event:
+            safe_add(
+                screen,
+                detail_top + 2,
+                2,
+                f"{event.timestamp}  {event.event_type}  source={event.source}  severity={event.severity}",
+            )
+            safe_add(screen, detail_top + 3, 2, event.summary or event.target)
+            detail_json = json.dumps(event.details, ensure_ascii=False, indent=2, sort_keys=True, default=str)
+            for offset, line in enumerate(detail_json.splitlines()[:5]):
+                safe_add(screen, detail_top + 4 + offset, 2, line, color(5))
+    elif state.show_detail:
+        safe_add(screen, height - 2, 1, "Event details need at least 18 terminal rows", color(3))
+
+
 def draw_help(screen: Any) -> None:
     height, width = screen.getmaxyx()
     box_width = min(72, width - 4)
     lines = [
         "WireScope keyboard",
         "",
-        "1–7 / ← → / h l    switch tabs",
+        "1–8 / ← → / h l    switch tabs",
         "↑ ↓ / j k / PgUp   select and scroll",
-        "/                  filter connections",
+        "/                  filter connections/timeline",
+        "m                  add timestamped user marker",
         "s                  cycle sort mode",
         "x                  show/hide CLOSED sockets",
-        "d / Enter          connection details",
+        "d / Enter          selected connection/event details",
         "n                  reverse-DNS selected remote",
         "g                  inspect selected effective route",
         "p / Space          pause/resume refresh",
         "r                  refresh now",
         "e                  export current snapshot",
-        "c                  clear filter and counters",
+        "c                  clear filter, counters, and timeline",
         "q / Esc            close help or quit",
         "?                  toggle this help",
     ]
@@ -537,6 +899,33 @@ def prompt_filter(screen: Any, state: LiveState) -> None:
         screen.timeout(100)
 
 
+def prompt_marker(screen: Any, state: LiveState) -> None:
+    height, width = screen.getmaxyx()
+    prompt = "Marker: "
+    curses.echo()
+    try:
+        curses.curs_set(1)
+    except curses.error:
+        pass
+    screen.timeout(-1)
+    safe_add(screen, height - 1, 0, " " * max(0, width - 1))
+    safe_add(screen, height - 1, 0, prompt, curses.A_BOLD)
+    try:
+        value = screen.getstr(height - 1, len(prompt), max(1, width - len(prompt) - 2))
+        state.add_marker(value.decode("utf-8", errors="replace"))
+        state.selection = 0
+        state.scroll = 0
+    except curses.error:
+        pass
+    finally:
+        curses.noecho()
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        screen.timeout(100)
+
+
 def draw(screen: Any, state: LiveState) -> None:
     screen.erase()
     height, width = screen.getmaxyx()
@@ -558,8 +947,10 @@ def draw(screen: Any, state: LiveState) -> None:
         draw_dns(screen, state, top)
     elif state.tab == 5:
         draw_vpn(screen, state, top)
-    else:
+    elif state.tab == 6:
         draw_routes(screen, state, top)
+    else:
+        draw_timeline(screen, state, top)
     draw_status(screen, state)
     if state.show_help:
         draw_help(screen)
@@ -619,10 +1010,19 @@ def run_curses(screen: Any, adapter: MacOSAdapter, interval: float, process: Opt
             state.show_help = not state.show_help
         elif key in (curses.KEY_RIGHT, ord("l")):
             state.tab = (state.tab + 1) % len(TABS)
+            state.selection = 0
+            state.scroll = 0
+            state.show_detail = False
         elif key in (curses.KEY_LEFT, ord("h")):
             state.tab = (state.tab - 1) % len(TABS)
+            state.selection = 0
+            state.scroll = 0
+            state.show_detail = False
         elif ord("1") <= key <= ord(str(len(TABS))):
             state.tab = key - ord("1")
+            state.selection = 0
+            state.scroll = 0
+            state.show_detail = False
         elif key in (curses.KEY_DOWN, ord("j")):
             state.selection += 1
         elif key in (curses.KEY_UP, ord("k")):
@@ -633,6 +1033,8 @@ def run_curses(screen: Any, adapter: MacOSAdapter, interval: float, process: Opt
             state.selection = max(0, state.selection - max(5, screen.getmaxyx()[0] - 10))
         elif key == ord("/"):
             prompt_filter(screen, state)
+        elif key == ord("m"):
+            prompt_marker(screen, state)
         elif key == ord("s"):
             state.sort_mode = sort_modes[(sort_modes.index(state.sort_mode) + 1) % len(sort_modes)]
         elif key == ord("x"):
@@ -642,9 +1044,15 @@ def run_curses(screen: Any, adapter: MacOSAdapter, interval: float, process: Opt
         elif key in (ord("d"), 10, 13):
             state.show_detail = not state.show_detail
         elif key == ord("n"):
-            state.resolve_selected()
+            if state.tab == 1:
+                state.resolve_selected()
+            else:
+                state.notice = "Reverse DNS is available on the Connections tab"
         elif key == ord("g"):
-            state.inspect_selected_route()
+            if state.tab == 1:
+                state.inspect_selected_route()
+            else:
+                state.notice = "Effective route lookup is available on the Connections tab"
         elif key in (ord("p"), ord(" ")):
             state.paused = not state.paused
         elif key == ord("r"):
@@ -662,6 +1070,9 @@ def run_curses(screen: Any, adapter: MacOSAdapter, interval: float, process: Opt
             state.opened_total = 0
             state.closed_total = 0
             state.events.clear()
+            state.network_fingerprints.clear()
+            state.network_values.clear()
+            state.marker_count = 0
             state.selection = 0
             state.scroll = 0
 
@@ -675,7 +1086,7 @@ def plain_snapshot(adapter: MacOSAdapter, process: Optional[str] = None) -> str:
     vpn = adapter.vpn_status()
     protocols = Counter(item.protocol for item in remote)
     lines = [
-        "WireScope 0.2.0 · network snapshot",
+        f"WireScope {__version__} · network snapshot",
         "═" * width,
         f"Connections {len(connections)} · Remote {len(remote)} · TCP {protocols.get('TCP', 0)} · UDP/QUIC {protocols.get('UDP', 0)} · VPN {'ACTIVE' if vpn.get('active') else 'OFF'}",
         f"{'PROCESS':16} {'PID':>7} {'PROTO':5} {'REMOTE':34} {'STATE':13} PATH",

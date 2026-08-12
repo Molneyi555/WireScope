@@ -1,0 +1,86 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wirescope"
+dynamic = ["version"]
+description = "Privacy-first terminal network observability for macOS"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+license-files = ["LICENSE", "LICENSES/*", "THIRD_PARTY_NOTICES.md"]
+authors = [
+  { name = "WireScope contributors" },
+]
+keywords = [
+  "macos",
+  "network-monitoring",
+  "network-observability",
+  "privacy",
+  "terminal",
+  "troubleshooting",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Intended Audience :: System Administrators",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: System :: Networking :: Monitoring",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2,<2",
+  "mypy>=1.11,<2",
+  "ruff>=0.12,<1",
+  "twine>=5,<7",
+]
+
+[project.scripts]
+wirescope = "wirescope.cli:main"
+wscope = "wirescope.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Molneyi555/WireScope"
+Documentation = "https://github.com/Molneyi555/WireScope#readme"
+Repository = "https://github.com/Molneyi555/WireScope.git"
+Issues = "https://github.com/Molneyi555/WireScope/issues"
+Changelog = "https://github.com/Molneyi555/WireScope/blob/main/CHANGELOG.md"
+Security = "https://github.com/Molneyi555/WireScope/security/policy"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"wirescope.data" = ["*.dat"]
+
+[tool.setuptools.dynamic]
+version = { attr = "wirescope.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["wirescope*"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 120
+
+[tool.ruff.lint]
+# Start with correctness-focused rules; broaden this set as legacy modules are
+# formatted without obscuring functional changes.
+select = ["E4", "E7", "E9", "F63", "F7", "F82"]
+
+[tool.mypy]
+python_version = "3.9"
+check_untyped_defs = true
+ignore_missing_imports = true
+show_error_codes = true
+warn_unused_configs = true

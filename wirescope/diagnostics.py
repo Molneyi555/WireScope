@@ -269,7 +269,11 @@ def trace_route(target: str, max_hops: int = 20, wait: float = 1.0) -> Dict[str,
     started = time.monotonic()
     command = ["/usr/sbin/traceroute", "-n", "-m", str(max_hops), "-w", str(wait), target]
     try:
-        output = run_command(command, timeout=max(10, max_hops * wait * 4))
+        output = run_command(
+            command,
+            timeout=max(10, max_hops * wait * 4),
+            valid_returncodes=(0, 1),
+        )
         error = None
     except CommandError as exc:
         output = ""

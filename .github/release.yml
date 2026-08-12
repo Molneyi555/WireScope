@@ -1,0 +1,19 @@
+changelog:
+  exclude:
+    labels:
+      - skip-changelog
+      - dependencies
+    authors:
+      - dependabot[bot]
+  categories:
+    - title: Security and privacy
+      labels: [security, privacy]
+    - title: New capabilities
+      labels: [enhancement, feature]
+    - title: Fixes
+      labels: [bug, fix]
+    - title: Documentation and community
+      labels: [documentation, community]
+    - title: Other changes
+      labels: ["*"]
+

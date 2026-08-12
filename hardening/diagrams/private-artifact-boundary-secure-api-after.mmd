@@ -1,0 +1,8 @@
+flowchart LR
+    U["Local user / CLI"] --> R["Recorders and exporters"]
+    N["Sensitive network metadata"] --> R
+    R --> A["Owned secure-artifact API\n0600 + symlink policy + atomic replace"]
+    A --> F["Private recording files"]
+    T["tcpdump output"] --> V["Post-create ownership/mode verification"]
+    V --> F
+    L["Other local accounts or processes"] -. "denied by invariant" .-> F

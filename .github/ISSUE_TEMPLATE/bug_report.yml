@@ -5,7 +5,7 @@ labels: [bug]
 body:
   - type: markdown
     attributes:
-      value: Do not attach private HAR, PCAP, JSONL, tokens, cookies, or unredacted URLs.
+      value: Do not attach private HAR, PCAP, JSONL, tokens, cookies, or unredacted URLs. Prefer a synthetic fixture or the smallest redacted example.
   - type: input
     id: version
     attributes:
@@ -20,6 +20,12 @@ body:
     validations:
       required: true
   - type: textarea
+    id: capabilities
+    attributes:
+      label: Doctor output
+      description: Paste redacted output from `wirescope doctor --json`.
+      render: json
+  - type: textarea
     id: steps
     attributes:
       label: Reproduction steps
@@ -31,4 +37,9 @@ body:
       label: Expected and actual behavior
     validations:
       required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Parser warnings or other evidence
+      description: Include exact errors and warnings, but remove personal paths, hostnames, addresses, and secrets.
 

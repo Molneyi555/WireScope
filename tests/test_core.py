@@ -1,10 +1,14 @@
 import json
 import tempfile
 import unittest
+from argparse import Namespace
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 
 from wirescope.cdp import sanitize
-from wirescope.config import DEFAULT_CONFIG, deep_merge
+from wirescope.cli import command_connections, command_routes, main
+from wirescope.config import DEFAULT_CONFIG, deep_merge, write_default_config
 from wirescope.har import load_har
 from wirescope.macos import (
     parse_endpoint,
@@ -20,6 +24,7 @@ from wirescope.macos import (
 )
 from wirescope.proxy import parse_host_port, validate_bind
 from wirescope.redact import redact_headers, redact_url
+from wirescope.models import Connection, Endpoint
 from wirescope.tui import process_rows, sparkline
 
 
@@ -174,11 +179,51 @@ class ProxyTests(unittest.TestCase):
 
 
 class ConvenienceTests(unittest.TestCase):
+    def test_json_limits_apply_to_connections_and_routes(self):
+        class Adapter:
+            @staticmethod
+            def connections():
+                return [
+                    Connection("app", 7, "me", str(index), "IPv4", "TCP", Endpoint("127.0.0.1", str(index)), None)
+                    for index in range(3)
+                ]
+
+            @staticmethod
+            def routes():
+                return [
+                    {"destination": str(index), "gateway": "192.0.2.1", "interface": "en0", "flags": "UG"}
+                    for index in range(3)
+                ]
+
+        args = Namespace(process=None, remote_only=False, state=None, json=True, limit=1, default=False)
+        output = StringIO()
+        with redirect_stdout(output):
+            command_connections(args, Adapter())
+        connections = json.loads(output.getvalue())
+        self.assertEqual(connections["count"], 1)
+        self.assertEqual(connections["total_count"], 3)
+        self.assertTrue(connections["truncated"])
+
+        output = StringIO()
+        with redirect_stdout(output):
+            command_routes(args, Adapter())
+        self.assertEqual(len(json.loads(output.getvalue())), 1)
+
+        with self.assertRaises(SystemExit):
+            main(["connections", "--limit", "-1"])
+
     def test_config_deep_merge_preserves_defaults(self):
         value = deep_merge(DEFAULT_CONFIG, {"browser": {"duration": 42}})
         self.assertEqual(value["browser"]["duration"], 42)
         self.assertIn("port", value["browser"])
         self.assertEqual(DEFAULT_CONFIG["browser"]["duration"], 20.0)
+
+    def test_default_config_is_written_privately(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            write_default_config(path)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), DEFAULT_CONFIG)
 
     def test_tui_helpers(self):
         values = parse_lsof(

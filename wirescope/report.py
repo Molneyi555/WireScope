@@ -2,8 +2,100 @@ from __future__ import annotations
 
 import html
 import json
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from copy import deepcopy
+from typing import Any, Dict, List, Optional
+
+from .artifacts import atomic_write_text
+from .redact import RedactionRules, redact_structure, redact_text, strict_share_safe_rules
+
+
+SHARING_SAFETY_SCHEMA_VERSION = 1
+
+
+def report_sharing_metadata(
+    share_safe: bool,
+    rules: Optional[RedactionRules] = None,
+) -> Dict[str, Any]:
+    """Describe whether and how a report was prepared for external sharing."""
+
+    if not share_safe:
+        return {
+            "schema_version": SHARING_SAFETY_SCHEMA_VERSION,
+            "mode": "private",
+            "share_safe": False,
+            "review_recommended": True,
+            "message": "This report was not prepared for external sharing.",
+        }
+    policy = strict_share_safe_rules(rules)
+    return {
+        "schema_version": SHARING_SAFETY_SCHEMA_VERSION,
+        "mode": "share-safe",
+        "share_safe": True,
+        "review_recommended": True,
+        "redactions": {
+            "all_header_values": policy.redact_all_headers,
+            "all_query_values": policy.redact_all_query_values,
+            "url_paths": policy.redact_url_paths,
+            "url_fragments_removed": policy.remove_url_fragments,
+            "known_secret_formats": policy.detect_value_secrets,
+            "high_entropy_candidates": policy.detect_high_entropy,
+            "ip_addresses": policy.redact_ip_addresses,
+            "email_addresses": policy.redact_email_addresses,
+            "hardware_addresses": policy.redact_hardware_addresses,
+            "local_paths": policy.redact_local_paths,
+            "custom_key_rules": [redact_text(value, policy) for value in policy.key_patterns],
+            "custom_header_rules": [redact_text(value, policy) for value in policy.header_patterns],
+            "custom_path_rules": [redact_text(value, policy) for value in policy.path_patterns],
+        },
+        "remaining_visible": [
+            "domain names",
+            "HTTP methods and statuses",
+            "resource types and protocols",
+            "timings, byte counts, findings, and aggregate metrics",
+        ],
+        "limitations": [
+            "Share-safe mode minimizes common secrets and identifiers but cannot prove that arbitrary free-form text is non-sensitive.",
+            "Domain names and findings remain visible because they are needed to interpret the network analysis.",
+            "Review the generated artifact before publishing it outside your trust boundary.",
+        ],
+    }
+
+
+def prepare_share_safe_report(
+    report: Dict[str, Any],
+    rules: Optional[RedactionRules] = None,
+) -> Dict[str, Any]:
+    """Return a strict, non-mutating share-safe representation of a report."""
+
+    policy = strict_share_safe_rules(rules)
+    sanitized = redact_structure(report, policy)
+    if not isinstance(sanitized, dict):
+        raise TypeError("report must sanitize to a JSON object")
+    sanitized["sharing_safety"] = report_sharing_metadata(True, policy)
+    return sanitized
+
+
+def prepare_share_safe_comparison(
+    comparison: Dict[str, Any],
+    rules: Optional[RedactionRules] = None,
+) -> Dict[str, Any]:
+    """Return a comparison safe for sharing without local source paths."""
+
+    policy = strict_share_safe_rules(rules)
+    sanitized = redact_structure(comparison, policy)
+    if not isinstance(sanitized, dict):
+        raise TypeError("comparison must sanitize to a JSON object")
+    for key in ("before", "after"):
+        if key in sanitized:
+            sanitized[key] = "[REDACTED SOURCE]"
+    sanitized["sharing_safety"] = report_sharing_metadata(True, policy)
+    return sanitized
+
+
+def _prepare_private_report(report: Dict[str, Any]) -> Dict[str, Any]:
+    value = deepcopy(report)
+    value["sharing_safety"] = report_sharing_metadata(False)
+    return value
 
 
 def esc(value: Any) -> str:
@@ -201,7 +293,17 @@ const buttons=[...document.querySelectorAll('.tabs button')];const views=[...doc
 """
 
 
-def generate_html_report(report: Dict[str, Any], output: str, title: str = "WireScope Network Report") -> None:
+def generate_html_report(
+    report: Dict[str, Any],
+    output: str,
+    title: str = "WireScope Network Report",
+    share_safe: bool = False,
+    redaction_rules: Optional[RedactionRules] = None,
+) -> None:
+    share_policy = strict_share_safe_rules(redaction_rules) if share_safe else None
+    report = prepare_share_safe_report(report, redaction_rules) if share_safe else _prepare_private_report(report)
+    if share_policy is not None:
+        title = redact_text(title, share_policy)
     summary = report.get("summary", {})
     requests = report.get("requests", [])
     aggregates = report.get("aggregates", {})
@@ -218,20 +320,35 @@ def generate_html_report(report: Dict[str, Any], output: str, title: str = "Wire
     ]
     card_html = "".join(f'<div class="card"><span>{esc(label)}</span><strong>{esc(value)}</strong></div>' for label, value in cards)
     raw_json = json.dumps(report, ensure_ascii=False, separators=(",", ":")).replace("<", "\\u003c")
+    sharing_label = "share-safe export · review before publishing" if share_safe else "private report · not prepared for sharing"
+    footer = (
+        "Share-safe redaction enabled. Domain names and analysis evidence remain visible; review before publishing."
+        if share_safe
+        else "Private report. Secrets are redacted by default, but this artifact was not prepared for external sharing."
+    )
     document = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)}</title><style>{CSS}</style></head><body>
-<header><div class="header-inner"><div class="brand"><div class="logo">W</div><div><h1>{esc(title)}</h1><p>{esc(report.get('source_type','recording'))} · generated {esc(report.get('generated_at',''))}</p></div></div><nav class="tabs"><button class="active" data-view="overview">Overview</button><button data-view="requests">Requests</button><button data-view="waterfall">Waterfall</button><button data-view="domains">Domains</button><button data-view="browser">Browser</button></nav></div></header>
+<header><div class="header-inner"><div class="brand"><div class="logo">W</div><div><h1>{esc(title)}</h1><p>{esc(report.get('source_type','recording'))} · generated {esc(report.get('generated_at',''))} · {esc(sharing_label)}</p></div></div><nav class="tabs"><button class="active" data-view="overview">Overview</button><button data-view="requests">Requests</button><button data-view="waterfall">Waterfall</button><button data-view="domains">Domains</button><button data-view="browser">Browser</button></nav></div></header>
 <main><section class="view active" id="overview"><div class="hero"><div><h2>Network session analysis</h2><p>{summary.get('requests',0)} requests across {summary.get('domains',0)} domains</p></div>{render_score_cards(report.get('scores',{}))}</div><div class="cards">{card_html}</div><div class="grid two"><section class="panel"><h2>Automated findings</h2>{render_findings(report.get('findings',[]))}</section><section class="panel"><h2>Resource types</h2>{render_aggregate_bars(aggregates.get('resource_types',{}))}<h2 style="margin-top:24px">Protocols</h2>{render_aggregate_bars(aggregates.get('protocols',{}))}</section></div></section>
 <section class="view" id="requests"><div class="toolbar"><input id="request-search" type="search" placeholder="Search URL, domain, method, MIME or protocol…"><select id="status-filter"><option value="all">All statuses</option><option value="success">Success</option><option value="redirect">Redirects</option><option value="error">Errors</option></select><select id="type-filter"><option value="all">All types</option>{type_options}</select><span class="count" id="visible-count"></span></div><div class="table-wrap"><table><thead><tr><th>#</th><th data-key="offset_ms">Start</th><th>Method</th><th data-key="status">Status</th><th>Type</th><th>URL</th><th>Protocol</th><th data-key="duration">Time</th><th data-key="size">Transfer</th><th>Details</th></tr></thead><tbody id="requests-body">{request_rows}</tbody></table></div></section>
 <section class="view" id="waterfall"><section class="panel"><h2>Request waterfall · first 80 by start time</h2>{render_waterfall(requests)}</section></section>
 <section class="view" id="domains"><section class="panel"><h2>Domains by transferred bytes</h2>{render_domain_bars(aggregates.get('domains',{}))}</section></section>
 <section class="view" id="browser">{render_browser_details(report.get('browser',{}))}</section></main>
-<footer>Generated locally by WireScope. Secrets are redacted by default. The report has no external assets and does not send telemetry.</footer><script id="wirescope-data" type="application/json">{raw_json}</script><script>{JS}</script></body></html>"""
-    destination = Path(output)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(document, encoding="utf-8")
+<footer>Generated locally by WireScope. {esc(footer)} The report has no external assets and does not send telemetry.</footer><script id="wirescope-data" type="application/json">{raw_json}</script><script>{JS}</script></body></html>"""
+    atomic_write_text(output, document)
 
 
-def generate_comparison_html(comparison: Dict[str, Any], output: str) -> None:
+def generate_comparison_html(
+    comparison: Dict[str, Any],
+    output: str,
+    share_safe: bool = False,
+    redaction_rules: Optional[RedactionRules] = None,
+) -> None:
+    comparison = (
+        prepare_share_safe_comparison(comparison, redaction_rules)
+        if share_safe
+        else deepcopy(comparison)
+    )
+    comparison.setdefault("sharing_safety", report_sharing_metadata(False))
     rows = []
     for key, value in comparison.get("deltas", {}).items():
         delta = value.get("delta", 0)
@@ -244,8 +361,9 @@ def generate_comparison_html(comparison: Dict[str, Any], output: str) -> None:
         delta = value.get("delta", 0)
         cls = "status-ok" if delta > 0 else ("status-bad" if delta < 0 else "")
         score_rows.append(f"<tr><td>{esc(key.title())}</td><td>{value.get('before')}</td><td>{value.get('after')}</td><td class='{cls}'>{delta:+g}</td></tr>")
-    document = f"""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>WireScope Comparison</title><style>{CSS}</style></head><body><header><div class='header-inner'><div class='brand'><div class='logo'>W</div><div><h1>WireScope comparison</h1><p>{esc(comparison.get('before'))} → {esc(comparison.get('after'))}</p></div></div></div></header><main><div class='grid two'><section class='panel'><h2>Network metric deltas</h2><div class='table-wrap'><table><thead><tr><th>Metric</th><th>Before</th><th>After</th><th>Delta</th><th>Change</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div></section><section class='panel'><h2>Score deltas</h2><div class='table-wrap'><table><thead><tr><th>Score</th><th>Before</th><th>After</th><th>Delta</th></tr></thead><tbody>{''.join(score_rows)}</tbody></table></div></section></div></main><footer>Generated locally by WireScope.</footer></body></html>"""
-    destination = Path(output)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(document, encoding="utf-8")
-
+    sharing_json = json.dumps(
+        comparison.get("sharing_safety", {}), ensure_ascii=False, separators=(",", ":")
+    ).replace("<", "\\u003c")
+    sharing_label = "share-safe · review before publishing" if share_safe else "private · not prepared for sharing"
+    document = f"""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>WireScope Comparison</title><style>{CSS}</style></head><body><header><div class='header-inner'><div class='brand'><div class='logo'>W</div><div><h1>WireScope comparison</h1><p>{esc(comparison.get('before'))} → {esc(comparison.get('after'))} · {esc(sharing_label)}</p></div></div></div></header><main><div class='grid two'><section class='panel'><h2>Network metric deltas</h2><div class='table-wrap'><table><thead><tr><th>Metric</th><th>Before</th><th>After</th><th>Delta</th><th>Change</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div></section><section class='panel'><h2>Score deltas</h2><div class='table-wrap'><table><thead><tr><th>Score</th><th>Before</th><th>After</th><th>Delta</th></tr></thead><tbody>{''.join(score_rows)}</tbody></table></div></section></div></main><footer>Generated locally by WireScope. {esc(sharing_label)}.</footer><script id='wirescope-sharing-safety' type='application/json'>{sharing_json}</script></body></html>"""
+    atomic_write_text(output, document)

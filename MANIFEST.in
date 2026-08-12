@@ -1,3 +1,12 @@
-include README.md LICENSE CHANGELOG.md CONTRIBUTING.md SECURITY.md
+include pyproject.toml setup.py
+include README.md LICENSE THIRD_PARTY_NOTICES.md CHANGELOG.md CONTRIBUTING.md SECURITY.md
+recursive-include LICENSES *.txt
+include CODE_OF_CONDUCT.md ROADMAP.md
+include Makefile
+include bin/wirescope
 recursive-include docs *.md
-
+recursive-include packaging *.template
+recursive-include tests/fixtures *.txt
+recursive-include benchmarks *.py
+recursive-include scripts *.py
+recursive-include wirescope/data *.dat

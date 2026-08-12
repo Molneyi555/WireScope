@@ -1,0 +1,29 @@
+class Wirescope < Formula
+  desc "Privacy-first terminal network observability for macOS"
+  homepage "https://github.com/Molneyi555/WireScope"
+  url "https://github.com/Molneyi555/WireScope/releases/download/v__VERSION__/wirescope-__VERSION__.tar.gz"
+  version "__VERSION__"
+  sha256 "__SHA256__"
+  license "Apache-2.0"
+
+  depends_on :macos
+  depends_on "python@3.13"
+
+  def install
+    libexec.install "wirescope"
+
+    (bin/"wirescope").write <<~PYTHON
+      #!#{Formula["python@3.13"].opt_bin}/python3.13
+      import sys
+      sys.path.insert(0, "#{libexec}")
+      from wirescope.cli import main
+      raise SystemExit(main())
+    PYTHON
+    bin.install_symlink "wirescope" => "wscope"
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/wirescope --version")
+    assert_match '"version"', shell_output("#{bin}/wirescope doctor --json")
+  end
+end

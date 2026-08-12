@@ -1,0 +1,164 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: macos-14
+    outputs:
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install release tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+      - name: Match tag and source versions
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          from packaging.version import Version
+          import wirescope
+
+          expected = "v" + wirescope.__version__
+          actual = os.environ["RELEASE_TAG"]
+          if actual != expected:
+              raise SystemExit(f"tag {actual!r} does not match source version {expected!r}")
+          prerelease = str(Version(wirescope.__version__).is_prerelease).lower()
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f"prerelease={prerelease}\n")
+              output.write(f"version={wirescope.__version__}\n")
+          PY
+      - name: Run release gate
+        run: make lint typecheck check test benchmark
+
+  publish:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+      attestations: write
+    steps:
+      - name: Resolve successful CI artifact for this commit
+        id: ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          run_id="$(gh api \
+            --method GET \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/$GH_REPO/actions/workflows/test.yml/runs?head_sha=$RELEASE_SHA&status=success&per_page=100" \
+            --jq ".workflow_runs | map(select(.event == \"push\" and .head_sha == \"$RELEASE_SHA\")) | sort_by(.run_number) | last | .id")"
+          if [[ ! "$run_id" =~ ^[0-9]+$ ]]; then
+            echo "No successful trusted CI push run found for $RELEASE_SHA." >&2
+            exit 1
+          fi
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+      - name: Download validated release assets
+        uses: actions/download-artifact@v7
+        with:
+          name: release-candidate-${{ github.sha }}
+          path: release-assets
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.ci.outputs.run_id }}
+      - name: Verify asset checksums
+        run: |
+          cd release-assets
+          sha256sum --check SHA256SUMS
+      - name: Reconcile existing GitHub release assets by digest
+        id: github_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          IS_PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            release_json="$(gh release view "$RELEASE_TAG" --json isDraft,isPrerelease)"
+            state="$(jq -r 'if .isDraft then "draft" else "published" end' <<< "$release_json")"
+            actual_prerelease="$(jq -r '.isPrerelease' <<< "$release_json")"
+            if [[ "$state" == "published" && "$actual_prerelease" != "$IS_PRERELEASE" ]]; then
+              echo "Published release prerelease state does not match source version." >&2
+              exit 1
+            fi
+            mkdir -p existing-release-assets
+            gh release download "$RELEASE_TAG" --dir existing-release-assets || true
+            RELEASE_STATE="$state" python - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+
+          def digests(directory: str) -> dict[str, str]:
+              paths = sorted(path for path in Path(directory).iterdir() if path.is_file())
+              return {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+
+          local = digests("release-assets")
+          remote = digests("existing-release-assets")
+          unexpected = sorted(remote.keys() - local.keys())
+          changed = sorted(name for name in local.keys() & remote.keys() if local[name] != remote[name])
+          missing = sorted(local.keys() - remote.keys())
+          if unexpected or changed or (os.environ["RELEASE_STATE"] == "published" and missing):
+              raise SystemExit(
+                  "GitHub release already has different immutable assets: "
+                  f"missing={missing}, unexpected={unexpected}, digest_mismatch={changed}"
+              )
+          Path("missing-github-assets.txt").write_text("\n".join(missing) + ("\n" if missing else ""), encoding="utf-8")
+          PY
+            if [[ "$state" == "draft" && -s missing-github-assets.txt ]]; then
+              while IFS= read -r name; do
+                gh release upload "$RELEASE_TAG" "release-assets/$name"
+              done < missing-github-assets.txt
+            fi
+            echo "state=$state" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=new" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Attest distributions
+        if: steps.github_release.outputs.state != 'published'
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: "release-assets/wirescope-*"
+      - name: Create draft GitHub release
+        if: steps.github_release.outputs.state == 'new'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          IS_PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
+            gh release create "$RELEASE_TAG" release-assets/* --verify-tag --generate-notes --prerelease --draft
+          else
+            gh release create "$RELEASE_TAG" release-assets/* --verify-tag --generate-notes --draft
+          fi
+      - name: Publish GitHub release
+        if: steps.github_release.outputs.state != 'published'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          IS_PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release edit "$RELEASE_TAG" --draft=false --prerelease="$IS_PRERELEASE"
