@@ -1,0 +1,8 @@
+flowchart LR
+    U["Local user / CLI"] --> R["Recorders and exporters"]
+    N["Sensitive network metadata"] --> R
+    R --> W1["Path.open / write_text"]
+    R --> W2["tcpdump -w"]
+    W1 --> F["Recording files\nmode inherited from umask"]
+    W2 --> F
+    L["Other local accounts or processes"] -. "read if mode permits" .-> F

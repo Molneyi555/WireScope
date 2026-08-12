@@ -1,0 +1,6 @@
+COMMAND          PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+Google\x20Chrome 601 alice 123u  IPv6 0x0123456789abcdef      0t0  TCP [fe80::1%en0]:51842->[2606:4700:4700::1111]:443 (ESTABLISHED)
+mDNSResponder     99 root   12u  IPv4 0x1123456789abcdef      0t0  UDP *:5353
+python3            77 alice   5u  IPv6 0x2123456789abcdef      0t0  TCP [::1]:8000 (LISTEN)
+truncated row
+broken nope alice 1u IPv4 0x0 0t0 TCP 127.0.0.1:1

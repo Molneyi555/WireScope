@@ -7,9 +7,11 @@ import signal
 import subprocess
 import time
 from collections import Counter
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .artifacts import external_artifact, private_text_stream
 from .models import utc_now
 
 
@@ -24,12 +26,11 @@ def validate_interface(interface: str) -> None:
 
 def capture_packets(interface: str, output: str, duration: float, expression: Optional[List[str]] = None) -> int:
     validate_interface(interface)
-    path = Path(output)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    command = ["/usr/sbin/tcpdump", "-n", "-i", interface, "-G", str(max(1, int(duration))), "-W", "1", "-w", str(path)]
-    if expression:
-        command.extend(expression)
-    completed = subprocess.run(command, check=False)
+    with external_artifact(output) as path:
+        command = ["/usr/sbin/tcpdump", "-n", "-i", interface, "-G", str(max(1, int(duration))), "-W", "1", "-w", str(path)]
+        if expression:
+            command.extend(expression)
+        completed = subprocess.run(command, check=False)
     return completed.returncode
 
 
@@ -71,58 +72,53 @@ def parse_dns_tcpdump_line(line: str) -> Optional[Dict[str, Any]]:
 def watch_dns(interface: str, duration: float, output: Optional[str] = None) -> Dict[str, Any]:
     validate_interface(interface)
     command = ["/usr/sbin/tcpdump", "-l", "-n", "-tttt", "-i", interface, "port", "53"]
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        errors="replace",
-        start_new_session=True,
-    )
-    stream = None
-    if output:
-        path = Path(output)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        stream = path.open("w", encoding="utf-8")
-    started = time.monotonic()
-    queries = 0
-    responses = 0
-    domains: Counter[str] = Counter()
-    servers: Counter[str] = Counter()
-    try:
-        while time.monotonic() - started < duration and process.poll() is None:
-            if process.stdout is None:
-                break
-            readable, _writable, _errors = select.select([process.stdout], [], [], 0.25)
-            if not readable:
-                continue
-            line = process.stdout.readline()
-            if not line:
-                continue
-            event = parse_dns_tcpdump_line(line)
-            if event is None:
-                continue
-            if event["direction"] == "query":
-                queries += 1
-                domains[event.get("domain", "unknown")] += 1
-                destination = event.get("destination") or {}
-                if destination.get("host"):
-                    servers[destination["host"]] += 1
-                print(f"→ {event.get('query_type', '?'):5} {event.get('domain', '?')}  dns={destination.get('host', '?')}", flush=True)
-            elif event["direction"] == "response":
-                responses += 1
-            if stream:
-                stream.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
-                stream.flush()
-    finally:
-        if process.poll() is None:
-            try:
-                process.send_signal(signal.SIGINT)
-                process.wait(timeout=2)
-            except (OSError, subprocess.TimeoutExpired):
-                process.terminate()
-        if stream:
-            stream.close()
+    with ExitStack() as stack:
+        stream = stack.enter_context(private_text_stream(output)) if output else None
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            start_new_session=True,
+        )
+        started = time.monotonic()
+        queries = 0
+        responses = 0
+        domains: Counter[str] = Counter()
+        servers: Counter[str] = Counter()
+        try:
+            while time.monotonic() - started < duration and process.poll() is None:
+                if process.stdout is None:
+                    break
+                readable, _writable, _errors = select.select([process.stdout], [], [], 0.25)
+                if not readable:
+                    continue
+                line = process.stdout.readline()
+                if not line:
+                    continue
+                event = parse_dns_tcpdump_line(line)
+                if event is None:
+                    continue
+                if event["direction"] == "query":
+                    queries += 1
+                    domains[event.get("domain", "unknown")] += 1
+                    destination = event.get("destination") or {}
+                    if destination.get("host"):
+                        servers[destination["host"]] += 1
+                    print(f"→ {event.get('query_type', '?'):5} {event.get('domain', '?')}  dns={destination.get('host', '?')}", flush=True)
+                elif event["direction"] == "response":
+                    responses += 1
+                if stream:
+                    stream.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+                    stream.flush()
+        finally:
+            if process.poll() is None:
+                try:
+                    process.send_signal(signal.SIGINT)
+                    process.wait(timeout=2)
+                except (OSError, subprocess.TimeoutExpired):
+                    process.terminate()
     stderr = process.stderr.read().strip() if process.stderr else ""
     if process.returncode not in (0, -signal.SIGINT, None) and queries == 0:
         raise RuntimeError(stderr or f"tcpdump exited with {process.returncode}; try running with sudo")
@@ -222,4 +218,3 @@ def analyze_pcap(path: str, packet_limit: int = 0) -> Dict[str, Any]:
         "stderr": stderr,
         "limited": bool(packet_limit and packets >= packet_limit),
     }
-

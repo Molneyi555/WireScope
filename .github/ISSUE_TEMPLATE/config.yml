@@ -1,0 +1,6 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Private security or privacy report
+    url: https://github.com/Molneyi555/WireScope/security/advisories/new
+    about: Do not post credentials, private captures, or vulnerability details in a public issue.
+

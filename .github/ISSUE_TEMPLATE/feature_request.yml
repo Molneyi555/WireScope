@@ -16,9 +16,28 @@ body:
       label: Proposed behavior
     validations:
       required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence and success criteria
+      description: What observable data would support the result, and how would we know the feature works?
+    validations:
+      required: true
   - type: dropdown
     id: privilege
     attributes:
       label: Does this require elevated privileges?
-      options: [No, Maybe, Yes]
-
+      options:
+        - "No"
+        - Maybe
+        - "Yes"
+  - type: dropdown
+    id: privacy
+    attributes:
+      label: Could this collect additional sensitive data?
+      options:
+        - "No"
+        - Maybe
+        - "Yes"
+    validations:
+      required: true

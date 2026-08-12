@@ -1,0 +1,6 @@
+flowchart LR
+    U["Local user / CLI"] --> R["Recorders and exporters"]
+    N["Sensitive network metadata"] --> R
+    R --> G["Per-call-site 0600 creation / chmod"]
+    G --> F["Private recording files"]
+    L["Other local accounts or processes"] -. "denied by file mode" .-> F

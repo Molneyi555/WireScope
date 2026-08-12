@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 from urllib.parse import urlsplit
 
+from .artifacts import private_text_stream
 from .models import utc_now
 from .redact import redact_headers, redact_url, safe_error
 
@@ -46,16 +47,17 @@ class EventWriter:
         self.capture_http_bodies = capture_http_bodies
         self.max_body_bytes = max_body_bytes
         self._stream = None
+        self._stream_context = None
 
     def __enter__(self) -> "EventWriter":
         if self.path:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._stream = self.path.open("a", encoding="utf-8")
+            self._stream_context = private_text_stream(self.path, append=True)
+            self._stream = self._stream_context.__enter__()
         return self
 
     def __exit__(self, *_args: object) -> None:
         if self._stream:
-            self._stream.close()
+            self._stream_context.__exit__(None, None, None)
 
     def emit(self, event: Dict[str, Any]) -> None:
         line = json.dumps(event, ensure_ascii=False, separators=(",", ":"))

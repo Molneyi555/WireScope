@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 import time
-from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, TextIO
 
+from .artifacts import private_text_stream
 from .macos import MacOSAdapter
 from .models import Connection, utc_now
 
@@ -21,14 +21,12 @@ def record_connections(
     interval: float,
     process: Optional[str] = None,
 ) -> Dict[str, Any]:
-    path = Path(output)
-    path.parent.mkdir(parents=True, exist_ok=True)
     previous: Dict[str, Connection] = {}
     opened = 0
     closed = 0
     snapshots = 0
     started = time.monotonic()
-    with path.open("w", encoding="utf-8") as stream:
+    with private_text_stream(output) as stream:
         write_event(
             stream,
             {
@@ -60,4 +58,3 @@ def record_connections(
         summary = {"snapshots": snapshots, "opened": opened, "closed": closed, "active_at_end": len(previous)}
         write_event(stream, {"type": "session_end", "timestamp": utc_now(), "summary": summary})
     return summary
-

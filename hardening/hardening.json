@@ -1,0 +1,96 @@
+{
+  "documentType": "codex-security.hardening-analysis",
+  "schemaVersion": "1.0",
+  "analysisId": "hardening_20260811_private_artifacts",
+  "sourceEvidence": {
+    "kind": "source_collection",
+    "label": "WireScope privacy threat model and artifact writers",
+    "collectionSha256": "8dfe9481e64aaa64256036dea008fd07a9ce4f202fdafc15ebad52e866a0c38b",
+    "artifactCount": 8,
+    "targetRevision": "03af0533fc3b8c20241618460ef566c3b6f2088c",
+    "sourceDrift": "none"
+  },
+  "assessment": {
+    "outcome": "opportunities_identified",
+    "summary": "Sensitive artifact creation is dispersed across recorders and can be consolidated behind an owner-only file boundary."
+  },
+  "constraints": {
+    "profile": "balanced",
+    "changeHorizons": ["incremental", "medium_term"],
+    "nonNegotiables": ["Preserve the dependency-free CLI", "Preserve output formats"],
+    "assumptions": ["No measured latency or memory budget was supplied.", "Local multi-user confidentiality is in scope."]
+  },
+  "opportunities": [
+    {
+      "opportunityId": "private-artifact-boundary",
+      "title": "Own the private artifact boundary",
+      "summary": "Make owner-only creation and safe replacement an invariant of one output API.",
+      "diagnosis": "Sensitive files are created independently by multiple modules, leaving access mode and path policy to ambient process state and caller discipline.",
+      "evidence": [
+        {"claimType": "observed", "sourceKind": "threat_model", "evidenceId": "E001", "path": "SECURITY.md", "claim": "WireScope artifacts can contain credentials and personal network metadata."},
+        {"claimType": "observed", "sourceKind": "source", "evidenceId": "E002", "path": "wirescope/record.py", "claim": "Multiple recorders and exporters create output with ordinary file primitives and no shared permission policy."},
+        {"claimType": "inferred", "sourceKind": "source", "evidenceId": "E003", "path": "wirescope/proxy.py", "claim": "Opt-in raw data increases the consequence of ambient file permissions."}
+      ],
+      "desiredInvariants": [
+        "Every WireScope-created artifact is owner-only from initial creation onward.",
+        "Sensitive writers reject unexpected final-component symlinks.",
+        "One-shot replacement is atomic where practical.",
+        "External writers are verified against the same policy."
+      ],
+      "proposalPath": "proposals/private-artifact-boundary.md",
+      "options": [
+        {
+          "optionId": "local-file-mode-guards",
+          "title": "Local file-mode guards",
+          "kind": "baseline",
+          "summary": "Add explicit owner-only creation and checks to every current writer.",
+          "diagramPaths": {"before": "diagrams/private-artifact-boundary-before.mmd", "after": "diagrams/private-artifact-boundary-local-modes-after.mmd"},
+          "evidenceCoverage": [
+            {"evidenceId": "E001", "effect": "mitigates", "tacticalFixRequired": true, "rationale": "Owner-only modes reduce local disclosure but do not change sharing behavior."},
+            {"evidenceId": "E002", "effect": "addresses", "tacticalFixRequired": true, "rationale": "Every known write site receives the direct guard."},
+            {"evidenceId": "E003", "effect": "mitigates", "tacticalFixRequired": true, "rationale": "Raw artifacts become owner-only, while explicit opt-in remains required."}
+          ],
+          "tradeoffs": [
+            {"dimension": "security", "direction": "improves", "confidence": "high", "basis": "source-derived", "assessment": "Known artifacts become owner-only, but future writers can omit the guard.", "validationPlan": "Create every artifact under umask 000 and inspect modes."},
+            {"dimension": "performance", "direction": "neutral", "confidence": "medium", "basis": "source-derived", "assessment": "Only per-file metadata operations are added.", "validationPlan": "Compare representative recording throughput before and after."},
+            {"dimension": "memory", "direction": "neutral", "confidence": "high", "basis": "source-derived", "assessment": "No retained buffers or processes are introduced.", "validationPlan": "Run representative recordings and compare peak RSS."},
+            {"dimension": "reliability", "direction": "neutral", "confidence": "medium", "basis": "source-derived", "assessment": "Current write topology remains; mode failures add explicit error paths.", "validationPlan": "Exercise writable, read-only, and overwrite destinations."},
+            {"dimension": "operability", "direction": "neutral", "confidence": "medium", "basis": "source-derived", "assessment": "No deployment component is added, but audits remain dispersed.", "validationPlan": "Search all output primitives during review."},
+            {"dimension": "migration", "direction": "neutral", "confidence": "high", "basis": "source-derived", "assessment": "Small edits preserve formats and CLI behavior.", "validationPlan": "Run current tests and new permission cases."}
+          ],
+          "residualRisks": ["Future output paths can omit the guard.", "Symlink and atomicity policy may remain inconsistent."],
+          "implementationReadiness": {"affectedComponents": ["wirescope/record.py", "wirescope/cdp.py", "wirescope/capture.py", "wirescope/proxy.py", "wirescope/report.py", "wirescope/tui.py"], "workPackages": ["Apply private creation and mode verification at every writer.", "Add permissive-umask regression tests."], "acceptanceCriteria": ["Every generated artifact is mode 0600 under umask 000."], "migrationNotes": ["Preserve existing overwrite and append semantics."], "rollback": "Revert each focused writer change."}
+        },
+        {
+          "optionId": "secure-artifact-api",
+          "title": "Central secure-artifact API",
+          "kind": "structural",
+          "summary": "Consolidate file creation, streaming, replacement, and verification behind one owned boundary.",
+          "diagramPaths": {"before": "diagrams/private-artifact-boundary-before.mmd", "after": "diagrams/private-artifact-boundary-secure-api-after.mmd"},
+          "evidenceCoverage": [
+            {"evidenceId": "E001", "effect": "mitigates", "tacticalFixRequired": true, "rationale": "The owned boundary enforces local confidentiality; sharing warnings remain."},
+            {"evidenceId": "E002", "effect": "addresses", "tacticalFixRequired": true, "rationale": "Current writers migrate to one policy owner while guards remain during rollout."},
+            {"evidenceId": "E003", "effect": "mitigates", "tacticalFixRequired": true, "rationale": "Raw data uses the same private sink; explicit opt-in remains necessary."}
+          ],
+          "tradeoffs": [
+            {"dimension": "security", "direction": "improves", "confidence": "high", "basis": "source-derived", "assessment": "The sink owns owner-only modes, symlink policy, and verification, reducing future drift.", "validationPlan": "Test all writer classes under permissive umask and symlink substitution."},
+            {"dimension": "performance", "direction": "neutral", "confidence": "medium", "basis": "source-derived", "assessment": "Metadata checks and atomic rename occur per artifact, not per event.", "validationPlan": "Compare event throughput and artifact completion latency on representative sessions."},
+            {"dimension": "memory", "direction": "neutral", "confidence": "high", "basis": "source-derived", "assessment": "Only bounded path and temporary-file state is added.", "validationPlan": "Compare peak RSS for streaming and one-shot outputs."},
+            {"dimension": "reliability", "direction": "improves", "confidence": "medium", "basis": "source-derived", "assessment": "Atomic one-shot replacement reduces partial files, though migration adds new error cases.", "validationPlan": "Interrupt writes and exercise cleanup, overwrite, and disk-error cases."},
+            {"dimension": "operability", "direction": "improves", "confidence": "medium", "basis": "source-derived", "assessment": "One boundary and test suite replace repeated security review at each sink.", "validationPlan": "Add a static search/check preventing unapproved direct writers."},
+            {"dimension": "migration", "direction": "regresses", "confidence": "high", "basis": "source-derived", "assessment": "One-shot, streaming, append, and external-tool outputs require separate adapters and compatibility tests.", "validationPlan": "Migrate by writer class with per-caller rollback."}
+          ],
+          "residualRisks": ["Owner-level malware and administrators can still read files.", "Stdout and deliberately shared copies remain outside the file boundary."],
+          "implementationReadiness": {"affectedComponents": ["new secure artifact module", "wirescope/record.py", "wirescope/cdp.py", "wirescope/capture.py", "wirescope/proxy.py", "wirescope/report.py", "wirescope/tui.py", "SECURITY.md"], "workPackages": ["Define and test the API contract.", "Protect current writers tactically.", "Migrate one-shot, streaming, and external writers incrementally."], "acceptanceCriteria": ["All artifact types are mode 0600 from creation.", "Unexpected final-component symlinks are rejected.", "One-shot replacements are atomic."], "migrationNotes": ["Preserve file formats, paths, append behavior, and CLI syntax."], "rollback": "Retain protected local writers until each migrated caller is validated."}
+        }
+      ],
+      "recommendedOptionId": "secure-artifact-api",
+      "recommendation": "Use a central secure-artifact API, introduced incrementally with local owner-only guards during migration."
+    }
+  ],
+  "openQuestions": [
+    "Are symlinked output destinations intentionally supported?",
+    "Should explicitly shareable reports use a separate permission override?",
+    "Must proxy logs append to existing files?"
+  ]
+}

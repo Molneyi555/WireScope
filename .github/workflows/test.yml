@@ -1,21 +1,189 @@
-name: test
+name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
 
 jobs:
-  unit:
+  test:
+    name: Tests · Python ${{ matrix.python-version }}
     runs-on: macos-14
+    timeout-minutes: 15
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.9", "3.12"]
+        python-version: ["3.9", "3.11", "3.13"]
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
-      - run: python -m unittest discover -s tests -v
-      - run: python -m py_compile wirescope/*.py tests/*.py
-      - run: ./bin/wirescope --version
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
+      - name: Install WireScope
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+
+      - name: Compile source and tests
+        run: python -m compileall -q wirescope tests
+
+      - name: Run unit and fixture tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Run quick release-path benchmark
+        run: make benchmark
+
+      - name: Smoke-test installed commands
+        run: |
+          wirescope --version
+          wscope --help > "${RUNNER_TEMP}/wscope-help.txt"
+          wirescope doctor --json > "${RUNNER_TEMP}/wirescope-doctor.json"
+
+  quality:
+    name: Static quality
+    runs-on: macos-14
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install development tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: Lint for correctness
+        run: make lint
+
+      - name: Check typed core modules
+        run: make typecheck
+
+  package:
+    name: Build and install artifacts
+    needs: [test, quality]
+    runs-on: macos-14
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install packaging tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'build>=1.2,<2' 'twine>=5,<7'
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Normalize source distribution metadata
+        env:
+          SOURCE_DATE_EPOCH: "0"
+        run: python scripts/normalize_sdist.py dist/*.tar.gz
+
+      - name: Validate package metadata and artifact count
+        run: |
+          python -m twine check dist/*
+          python - <<'PY'
+          from pathlib import Path
+          import tarfile
+          import zipfile
+
+          artifacts = sorted(Path("dist").iterdir())
+          wheels = [path for path in artifacts if path.suffix == ".whl"]
+          sdists = [path for path in artifacts if path.name.endswith(".tar.gz")]
+          assert len(wheels) == 1, wheels
+          assert len(sdists) == 1, sdists
+          assert all(path.stat().st_size > 0 for path in wheels + sdists)
+
+          with zipfile.ZipFile(wheels[0]) as archive:
+              wheel_names = set(archive.namelist())
+          assert "wirescope/__init__.py" in wheel_names
+          assert "wirescope/cli.py" in wheel_names
+          assert "wirescope/session.py" in wheel_names
+          assert "wirescope/lifecycle.py" in wheel_names
+          assert "wirescope/rules.py" in wheel_names
+          assert "wirescope/baseline.py" in wheel_names
+          assert "wirescope/manifest.py" in wheel_names
+          assert any(name.endswith(".dist-info/entry_points.txt") for name in wheel_names)
+
+          with tarfile.open(sdists[0], "r:gz") as archive:
+              sdist_names = set(archive.getnames())
+          required_suffixes = (
+              "/pyproject.toml",
+              "/README.md",
+              "/docs/RELEASING.md",
+              "/packaging/homebrew/wirescope.rb.template",
+              "/tests/fixtures/macos/lsof_variants.txt",
+              "/benchmarks/benchmark_core.py",
+          )
+          for suffix in required_suffixes:
+              assert any(name.endswith(suffix) for name in sdist_names), suffix
+          PY
+
+      - name: Run tests from the source distribution
+        run: |
+          mkdir "${RUNNER_TEMP}/wirescope-sdist-smoke"
+          tar -xzf dist/*.tar.gz -C "${RUNNER_TEMP}/wirescope-sdist-smoke"
+          cd "${RUNNER_TEMP}/wirescope-sdist-smoke"/wirescope-*
+          python -m unittest discover -s tests -q
+
+      - name: Smoke-test the built wheel in a fresh environment
+        run: |
+          python -m venv "${RUNNER_TEMP}/wirescope-wheel-smoke"
+          "${RUNNER_TEMP}/wirescope-wheel-smoke/bin/python" -m pip install --no-index --no-deps --find-links dist wirescope
+          "${RUNNER_TEMP}/wirescope-wheel-smoke/bin/wirescope" --version
+          "${RUNNER_TEMP}/wirescope-wheel-smoke/bin/wscope" --help > "${RUNNER_TEMP}/wheel-help.txt"
+          "${RUNNER_TEMP}/wirescope-wheel-smoke/bin/wirescope" doctor --json > "${RUNNER_TEMP}/wheel-doctor.json"
+
+      - name: Generate checksums
+        working-directory: dist
+        run: |
+          shasum -a 256 *.whl *.tar.gz > SHA256SUMS
+          shasum -a 256 -c SHA256SUMS
+
+      - name: Stage immutable release candidate
+        run: |
+          mkdir release-assets
+          cp dist/*.whl dist/*.tar.gz dist/SHA256SUMS release-assets/
+
+      - name: Upload verified release candidate
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-candidate-${{ github.sha }}
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 30

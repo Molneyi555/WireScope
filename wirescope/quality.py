@@ -16,7 +16,11 @@ from .redact import safe_error
 def ping_probe(host: str, count: int = 5) -> ProbeResult:
     started = time.monotonic()
     try:
-        output = run_command(["/sbin/ping", "-n", "-c", str(count), "-W", "1000", host], timeout=max(5, count * 2))
+        output = run_command(
+            ["/sbin/ping", "-n", "-c", str(count), "-W", "1000", host],
+            timeout=max(5, count * 2),
+            valid_returncodes=(0, 1),
+        )
     except CommandError as exc:
         return ProbeResult(target=host, ok=False, duration_ms=(time.monotonic() - started) * 1000, error=safe_error(str(exc)))
     loss_match = re.search(r"([\d.]+)% packet loss", output)

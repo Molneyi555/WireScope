@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from .artifacts import atomic_write_text
+
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "live": {"interval": 1.5},
@@ -63,10 +65,9 @@ def write_default_config(path: Path, overwrite: bool = False) -> None:
     if path.exists() and not overwrite:
         raise FileExistsError(f"{path} already exists; pass --force to replace it")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    atomic_write_text(path, json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2) + "\n")
 
 
 def get(config: Dict[str, Any], section: str, key: str, fallback: Any) -> Any:
     value = config.get(section, {})
     return value.get(key, fallback) if isinstance(value, dict) else fallback
-

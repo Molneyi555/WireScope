@@ -9,66 +9,18 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, urlsplit
 
+from .assessment import build_assessment_context, calculate_scorecard
+from .artifacts import atomic_text_writer, atomic_write_text
 from .har import load_har
 from .models import utc_now
-
-
-TRACKER_PATTERNS = (
-    "google-analytics.com",
-    "googletagmanager.com",
-    "doubleclick.net",
-    "googlesyndication.com",
-    "facebook.net",
-    "facebook.com/tr",
-    "connect.facebook.net",
-    "analytics.twitter.com",
-    "hotjar.com",
-    "clarity.ms",
-    "segment.io",
-    "segment.com",
-    "mixpanel.com",
-    "amplitude.com",
-    "matomo",
-    "metrika.yandex",
-    "mc.yandex",
-    "tiktok.com/i18n/pixel",
-)
-
-COMMON_MULTI_SUFFIXES = {
-    "co.uk",
-    "org.uk",
-    "com.au",
-    "com.br",
-    "co.jp",
-    "co.in",
-    "com.cn",
-    "com.ru",
-    "co.nz",
-}
+from .public_suffix import registrable_domain
+from .tracker import classify_tracker, is_tracker
 
 
 def base_domain(host: str) -> str:
-    host = (host or "").lower().rstrip(".")
-    if not host:
-        return ""
-    try:
-        # Avoid importing ipaddress on the hot path; these forms are already atomic.
-        if all(part.isdigit() for part in host.split(".")) or ":" in host:
-            return host
-    except ValueError:
-        return host
-    labels = host.split(".")
-    if len(labels) <= 2:
-        return host
-    suffix = ".".join(labels[-2:])
-    if suffix in COMMON_MULTI_SUFFIXES and len(labels) >= 3:
-        return ".".join(labels[-3:])
-    return suffix
+    """Backward-compatible name for the PSL-derived registrable domain."""
 
-
-def is_tracker(url: str, domain: str) -> bool:
-    lowered = url.lower()
-    return any(pattern in lowered or pattern in domain.lower() for pattern in TRACKER_PATTERNS)
+    return registrable_domain(host)
 
 
 def read_jsonl(path: str) -> Tuple[List[Dict[str, Any]], List[str]]:
@@ -183,10 +135,12 @@ def apply_response(item: Dict[str, Any], response: Dict[str, Any]) -> None:
 def normalize_requests(requests: List[Dict[str, Any]]) -> None:
     starts = [item["started_monotonic"] for item in requests if isinstance(item.get("started_monotonic"), (int, float))]
     first_start = min(starts) if starts else 0.0
-    document_hosts = [urlsplit(item.get("document_url", "")).hostname for item in requests]
+    document_hosts = [urlsplit(str(item.get("document_url") or "")).hostname for item in requests]
     primary_host = next((host for host in document_hosts if host), None)
+    primary_source = "document_url"
     if primary_host is None and requests:
         primary_host = requests[0].get("domain")
+        primary_source = "first_request_inference"
     primary_base = base_domain(primary_host or "")
     for item in requests:
         wall_time = item.get("started_wall_time")
@@ -194,8 +148,15 @@ def normalize_requests(requests: List[Dict[str, Any]]) -> None:
             item["started_at"] = datetime.fromtimestamp(wall_time, timezone.utc).isoformat(timespec="milliseconds")
         start = item.get("started_monotonic")
         item["offset_ms"] = round((start - first_start) * 1000, 2) if isinstance(start, (int, float)) else 0.0
-        item["third_party"] = bool(primary_base and base_domain(item.get("domain", "")) != primary_base)
-        item["tracker"] = is_tracker(item.get("url", ""), item.get("domain", ""))
+        request_base = base_domain(str(item.get("domain") or ""))
+        item["registrable_domain"] = request_base
+        item["primary_registrable_domain"] = primary_base
+        item["third_party"] = bool(primary_base and request_base and request_base != primary_base)
+        item["third_party_confidence"] = "high" if primary_source == "document_url" else "low"
+        item["third_party_basis"] = "public-suffix-list-etld-plus-one"
+        tracker_match = classify_tracker(str(item.get("url") or ""), str(item.get("domain") or ""))
+        item["tracker_match"] = tracker_match
+        item["tracker"] = tracker_match is not None
         body = item.get("body_bytes", 0) or 0
         transfer = item.get("transfer_bytes", 0) or 0
         item["compression_ratio"] = round(body / transfer, 2) if transfer and body > transfer else None
@@ -316,10 +277,7 @@ def analyze_cdp_events(events: Sequence[Dict[str, Any]], parse_errors: Optional[
         "websocket": websocket,
         "recorder_summary": session_summary,
     }
-    report["scores"], score_findings = calculate_scores(report)
-    report["findings"] = score_findings + generate_findings(report)
-    report["findings"] = sort_findings(report["findings"])
-    return report
+    return finalize_report(report)
 
 
 def normalize_har(report: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -398,6 +356,8 @@ def build_report(requests: List[Dict[str, Any]], source_type: str, metadata: Dic
     statuses: Counter[str] = Counter()
     methods: Counter[str] = Counter()
     mime_types: Counter[str] = Counter()
+    tracker_categories: Counter[str] = Counter()
+    tracker_rules: Counter[str] = Counter()
     total_bytes = 0
     total_body = 0
     failed = 0
@@ -432,6 +392,10 @@ def build_report(requests: List[Dict[str, Any]], source_type: str, metadata: Dic
         cached += int(bool(item.get("from_cache")))
         third_party += int(bool(item.get("third_party")))
         trackers += int(bool(item.get("tracker")))
+        tracker_match = item.get("tracker_match")
+        if isinstance(tracker_match, dict):
+            tracker_categories[str(tracker_match.get("category") or "unknown")] += 1
+            tracker_rules[str(tracker_match.get("rule_id") or "unknown")] += 1
         max_end = max(max_end, offset + duration)
         url_counts[str(item.get("url", ""))] += 1
     sorted_domains = dict(sorted(domains.items(), key=lambda pair: (-pair[1]["bytes"], -pair[1]["requests"], pair[0])))
@@ -467,6 +431,8 @@ def build_report(requests: List[Dict[str, Any]], source_type: str, metadata: Dic
             "statuses": dict(statuses.most_common()),
             "methods": dict(methods.most_common()),
             "mime_types": dict(mime_types.most_common(30)),
+            "tracker_categories": dict(tracker_categories.most_common()),
+            "tracker_rules": dict(tracker_rules.most_common()),
         },
         "requests": requests,
         "scores": {},
@@ -475,49 +441,71 @@ def build_report(requests: List[Dict[str, Any]], source_type: str, metadata: Dic
 
 
 def calculate_scores(report: Dict[str, Any]) -> Tuple[Dict[str, int], List[Dict[str, Any]]]:
-    summary = report["summary"]
-    count = max(1, summary["requests"])
-    performance = 100
-    performance -= min(35, round(summary["slow_requests"] / count * 80))
-    performance -= min(25, summary["large_requests"] * 5)
-    performance -= min(15, round(summary["duplicate_requests"] / count * 40))
-    if summary["page_span_ms"] > 10_000:
-        performance -= 20
-    elif summary["page_span_ms"] > 5_000:
-        performance -= 10
-    reliability = 100 - min(70, (summary["failed"] + summary["http_errors"]) * 8)
-    privacy = 100 - min(55, summary["trackers"] * 7) - min(25, round(summary["third_party_percent"] / 4))
-    insecure = sum(item.get("scheme") == "http" and item.get("domain") not in ("localhost", "127.0.0.1", "::1") for item in report["requests"])
-    old_tls = sum(
-        str((item.get("security_details") or {}).get("protocol", "")).lower() in ("tls 1.0", "tls 1.1")
+    scorecard = calculate_scorecard(report)
+    insecure_items = [
+        item
         for item in report["requests"]
-    )
-    security = 100 - min(60, insecure * 15) - min(30, old_tls * 10)
-    scores = {
-        "overall": max(0, round((performance + reliability + privacy + security) / 4)),
-        "performance": max(0, performance),
-        "reliability": max(0, reliability),
-        "privacy": max(0, privacy),
-        "security": max(0, security),
-    }
+        if item.get("scheme") == "http" and item.get("domain") not in ("localhost", "127.0.0.1", "::1")
+    ]
+    old_tls_items = [
+        item
+        for item in report["requests"]
+        if str((item.get("security_details") or {}).get("protocol", "")).lower() in ("tls 1.0", "tls 1.1")
+    ]
+    scores = scorecard["scores"]
     findings = []
-    if insecure:
+    if insecure_items:
         findings.append(
-            finding("critical", "security", "unencrypted-http", f"{insecure} unencrypted HTTP requests", "Use HTTPS for every non-local resource.")
+            finding(
+                "critical",
+                "security",
+                "unencrypted-http",
+                f"{len(insecure_items)} unencrypted HTTP requests",
+                "Use HTTPS for every non-local resource.",
+                [str(item.get("url") or "") for item in insecure_items[:10]],
+                confidence="high",
+                basis="observed",
+            )
         )
-    if old_tls:
-        findings.append(finding("critical", "security", "legacy-tls", f"{old_tls} requests use legacy TLS", "Disable TLS 1.0/1.1 on the server."))
+    if old_tls_items:
+        findings.append(
+            finding(
+                "critical",
+                "security",
+                "legacy-tls",
+                f"{len(old_tls_items)} requests use legacy TLS",
+                "Disable TLS 1.0/1.1 on the server.",
+                [f"{(item.get('security_details') or {}).get('protocol')} {item.get('url', '')}" for item in old_tls_items[:10]],
+                confidence="high",
+                basis="observed",
+            )
+        )
     return scores, findings
 
 
-def finding(severity: str, category: str, code: str, title: str, recommendation: str = "", evidence: Optional[List[str]] = None) -> Dict[str, Any]:
+def finding(
+    severity: str,
+    category: str,
+    code: str,
+    title: str,
+    recommendation: str = "",
+    evidence: Optional[List[str]] = None,
+    confidence: str = "high",
+    limitations: Optional[List[str]] = None,
+    basis: str = "observed",
+) -> Dict[str, Any]:
+    evidence_values = [str(value) for value in (evidence or [])]
     return {
         "severity": severity,
         "category": category,
         "code": code,
         "title": title,
         "recommendation": recommendation,
-        "evidence": evidence or [],
+        "evidence": evidence_values,
+        "confidence": confidence,
+        "basis": basis,
+        "limitations": limitations or [],
+        "evidence_details": [{"type": "observation", "value": value} for value in evidence_values],
     }
 
 
@@ -574,18 +562,40 @@ def generate_findings(report: Dict[str, Any]) -> List[Dict[str, Any]]:
             )
         )
     if summary["trackers"]:
-        tracker_domains = sorted({item.get("domain", "") for item in requests if item.get("tracker")})
+        tracker_count = int(summary["trackers"])
+        request_label = "request" if tracker_count == 1 else "requests"
+        tracker_items = [item for item in requests if item.get("tracker_match")]
+        tracker_evidence = []
+        for item in tracker_items[:10]:
+            match = item["tracker_match"]
+            tracker_evidence.append(
+                f"{item.get('domain', '')} — {match.get('rule_id')} ({match.get('category')}, {match.get('confidence')} confidence)"
+            )
         findings.append(
             finding(
                 "warning" if summary["trackers"] >= 3 else "info",
                 "privacy",
                 "tracking-requests",
-                f"{summary['trackers']} likely tracking/analytics requests",
+                f"{tracker_count} {request_label} matched curated tracker signatures",
                 "Review consent, necessity, retention, and third-party privacy terms.",
-                tracker_domains[:10],
+                tracker_evidence,
+                confidence="medium",
+                limitations=[
+                    "Endpoint signatures do not prove user tracking, consent status, purpose, or legal compliance.",
+                    "The bundled dataset is intentionally small and unmatched traffic may still contain analytics or tracking.",
+                ],
+                basis="heuristic",
             )
         )
     if summary["third_party_percent"] >= 50:
+        third_party_domains = sorted(
+            {
+                str(item.get("registrable_domain") or item.get("domain") or "")
+                for item in requests
+                if item.get("third_party")
+            }
+        )
+        inferred = any(item.get("third_party_confidence") == "low" for item in requests)
         findings.append(
             finding(
                 "warning",
@@ -593,25 +603,73 @@ def generate_findings(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "third-party-heavy",
                 f"{summary['third_party_percent']}% of requests are third-party",
                 "Audit third-party dependencies and self-host critical assets where practical.",
+                third_party_domains[:10],
+                confidence="low" if inferred else "high",
+                limitations=["The primary site was inferred from the first request."] if inferred else [],
+                basis="derived",
             )
         )
     http1 = sum(count for protocol, count in report["aggregates"]["protocols"].items() if protocol.lower() in ("http/1.0", "http/1.1"))
     if http1 >= 5:
         findings.append(
-            finding("info", "performance", "http1-heavy", f"{http1} requests use HTTP/1.x", "Enable HTTP/2 or HTTP/3 where supported.")
+            finding(
+                "info",
+                "performance",
+                "http1-heavy",
+                f"{http1} requests use HTTP/1.x",
+                "Enable HTTP/2 or HTTP/3 where supported.",
+                [f"Observed protocol counts: {report['aggregates']['protocols']}"],
+            )
         )
     if summary["cache_percent"] < 10 and summary["requests"] >= 20:
         findings.append(
-            finding("info", "performance", "low-cache-hit", f"Only {summary['cache_percent']}% of requests were served from cache", "Review Cache-Control, ETag and immutable asset naming.")
+            finding(
+                "info",
+                "performance",
+                "low-cache-hit",
+                f"Only {summary['cache_percent']}% of requests were served from cache",
+                "Review Cache-Control, ETag and immutable asset naming.",
+                [f"{summary['cached']}/{summary['requests']} requests were marked as cache hits"],
+                confidence="medium",
+                limitations=["Cache metadata availability differs between recording sources."],
+                basis="derived",
+            )
         )
     if not findings:
-        findings.append(finding("ok", "overview", "clean-session", "No major issues detected in this recording"))
+        findings.append(
+            finding(
+                "ok",
+                "overview",
+                "clean-session",
+                "No major issues detected by the enabled rules",
+                evidence=[f"Evaluated {summary['requests']} requests"],
+                confidence="medium",
+                limitations=["A clean rule result does not prove that the session is private, secure, or error-free."],
+                basis="heuristic",
+            )
+        )
     return findings
 
 
 def sort_findings(values: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     order = {"critical": 0, "warning": 1, "info": 2, "ok": 3}
     return sorted(values, key=lambda item: (order.get(item.get("severity", "info"), 2), item.get("category", ""), item.get("code", "")))
+
+
+def finalize_report(report: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach scores plus additive evidence/assessment metadata."""
+
+    report["scores"], initial = calculate_scores(report)
+    context = build_assessment_context(report, report["scores"])
+    report["facts"] = context["facts"]
+    report["assessments"] = context["assessments"]
+    report["analysis_metadata"] = {
+        "methodology_version": context["methodology_version"],
+        "datasets": context["datasets"],
+        "score_compatibility": "Scores remain heuristic 0-100 values for existing consumers; assessments carry confidence and limitations.",
+    }
+    report["findings"] = sort_findings(initial + generate_findings(report))
+    return report
 
 
 def analyze_recording(path: str, show_sensitive: bool = False) -> Dict[str, Any]:
@@ -622,9 +680,7 @@ def analyze_recording(path: str, show_sensitive: bool = False) -> Dict[str, Any]
         raw = load_har(path, show_sensitive=show_sensitive)
         requests = normalize_har(raw)
         report = build_report(requests, "har", {"source": path, "har_summary": raw.get("summary", {})}, [])
-        report["scores"], initial = calculate_scores(report)
-        report["findings"] = sort_findings(initial + generate_findings(report))
-        return report
+        return finalize_report(report)
     events, parse_errors = read_jsonl(path)
     if any(item.get("type") == "cdp_event" for item in events):
         report = analyze_cdp_events(events, parse_errors=parse_errors)
@@ -676,9 +732,7 @@ def analyze_recording(path: str, show_sensitive: bool = False) -> Dict[str, Any]
             )
         normalize_requests(requests)
         report = build_report(requests, "proxy-jsonl", {"path": path}, parse_errors)
-        report["scores"], initial = calculate_scores(report)
-        report["findings"] = sort_findings(initial + generate_findings(report))
-        return report
+        return finalize_report(report)
     connection_events = [item for item in events if item.get("type") in ("connection_open", "connection_close")]
     if connection_events:
         processes = Counter(item.get("connection", {}).get("process", "unknown") for item in connection_events)
@@ -762,9 +816,7 @@ def export_requests_csv(report: Dict[str, Any], output: str) -> None:
         "failed",
         "url",
     ]
-    destination = Path(output)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with destination.open("w", encoding="utf-8", newline="") as stream:
+    with atomic_text_writer(output, newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(report.get("requests", []))
@@ -839,6 +891,4 @@ def export_har(report: Dict[str, Any], output: str) -> None:
             "entries": entries,
         }
     }
-    destination = Path(output)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(json.dumps(har, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(output, json.dumps(har, ensure_ascii=False, indent=2))
